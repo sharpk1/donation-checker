@@ -15,12 +15,7 @@ def check_donation_option(url):
 
         # List of keywords to search for
         keywords = [
-    'donate', 'give', 'giving', 'donation', 'contribute', 'contribution', 
-    'support', 'help', 'fund', 'funding', 'tithing', 'pledge', 'sponsor', 
-    'benefactor', 'patron', 'charity', 'philanthropy', 'aid', 'assist', 
-    'backing', 'endowment', 'grant', 'gift', 'offering', 'partnership', 
-    'relief', 'subsidize', 'underwrite', 'match', 'matching', 'campaign', 
-    'fundraise', 'fundraiser', 'capital campaign', 'benefit'
+    'donate', 'give', 'giving', 'donation', 'contribute',
 ]
 
         # Searching for the keywords in the text of the webpage
