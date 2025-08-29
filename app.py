@@ -1,7 +1,7 @@
 import streamlit as st
 from churchScrape import check_donation_option  # Import your function
 
-st.title('Client Portal Option Checker')
+st.title('Client Portal Option Checker v2')
 
 # Text area for input
 url_input = st.text_area("Enter the URLs (one per line):")

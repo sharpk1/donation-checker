@@ -15,7 +15,7 @@ def check_donation_option(url):
 
         # List of keywords to search for
         keywords = [
-    'portal', 'login', 'client portal', 'client center', 'contribute',
+    'portal', 'login', 'client portal', 'client center', 'Portal', 'Login', 'Client Portal', 'Client Center',
 ]
 
         # Searching for the keywords in the text of the webpage
