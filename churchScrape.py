@@ -8,21 +8,18 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA})
 
-# Text that often appears ON the site (menu labels, headings, buttons)
-# Split into strong portal phrases (safe to match in plain text) vs generic login words (only trust when linked)
+# Strong phrases we accept from free text
 STRONG_TEXT_KEYWORDS = [
     "client login", "client portal", "client center", "client access",
     "my account", "account login", "secure login", "secure portal",
     "file upload", "upload files", "upload documents",
     "share files", "send files",
 ]
-GENERIC_LOGIN_WORDS = [
-    "log in", "login", "sign in", "signin"
-]
+# Only trusted when it's an actual link and the URL is vendor or client/portal path
+GENERIC_LOGIN_WORDS = ["log in", "login", "sign in", "signin"]
 
-# Hints in hrefs (vendors + common paths). These catch off-site portals.
-HREF_HINTS = [
-    # vendor domains
+# Vendor domains (off-site portals)
+VENDOR_DOMAINS = [
     "sharefile.com",          # Citrix ShareFile
     "smartvault.com",         # SmartVault
     "netclientcs.com",        # Thomson Reuters NetClient CS
@@ -35,94 +32,155 @@ HREF_HINTS = [
     "verifyle.com",
     "fileinvite.com",
     "suralink.com",
-    "intuit.com/link",        # Intuit Link
-    # generic paths/words
-    "client-portal", "clientportal", "client_center", "clientcenter",
-    "/portal", "/login", "/signin", "/clients", "/account"
+    "intuit.com",             # Intuit Link lives under this; we’ll check path
 ]
 
-# Common “guess” paths to probe if the home page doesn’t show it
+# Client/portal-ish path hints (safe on same-origin)
+CLIENT_PATH_HINTS = [
+    "client-portal", "clientportal", "client_center", "clientcenter",
+    "/client", "/clients", "/portal", "/client-login", "/clientlogin",
+    "/account/login", "/accounts/login"  # still require client/portal word
+]
+
+# We explicitly DO NOT treat these generic auth paths as signals by themselves.
+GENERIC_AUTH_PATHS = ["/login", "/signin", "/sign-in", "/account", "/user/login", "/auth/login"]
+
+# Common “guess” paths to probe
 COMMON_PORTAL_PATHS = [
     "/client-portal", "/clientportal", "/client-login",
-    "/clientcenter", "/portal", "/login", "/clients"
+    "/clientcenter", "/portal", "/clients"
 ]
 
-# WordPress login patterns (ignore these)
-WP_LOGIN_PATH_RE = re.compile(r"(/wp-login\.php(\?|$))|(/wp-admin/?(\?|$))", re.I)
+# WordPress login patterns (block these completely)
+WP_LOGIN_URL_RE = re.compile(
+    r"(^|/)(wp-login\.php|wp-admin|wp-json)(/|$)", re.I
+)
+WP_ANY_WP_RE = re.compile(r"(^|/)wp-[a-z0-9_-]+", re.I)  # extra safety (e.g., /wp-sso/, /wp-security-login/)
 
 def _is_wp_login_url(url: str) -> bool:
     try:
         p = urlparse(url or "")
-        return bool(WP_LOGIN_PATH_RE.search(p.path or ""))
+        full = (p.path or "") + ("?" + (p.query or "") if p.query else "")
+        return bool(WP_LOGIN_URL_RE.search(full) or WP_ANY_WP_RE.search(full))
     except Exception:
         return False
-
-def _has_wp_login(soup: BeautifulSoup, base_url: str) -> bool:
-    # a) anchors that go to wp-login/wp-admin
-    for a in soup.find_all("a", href=True):
-        if _is_wp_login_url(urljoin(base_url, a.get("href"))):
-            return True
-    # b) forms posting to wp-login
-    for f in soup.find_all("form", action=True):
-        if _is_wp_login_url(urljoin(base_url, f.get("action"))):
-            return True
-    return False
 
 def _fetch(url):
     r = SESSION.get(url, timeout=15, allow_redirects=True)
     r.raise_for_status()
     return r
 
+def _norm(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+def _is_vendor_url(abs_href: str) -> bool:
+    try:
+        p = urlparse(abs_href)
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+        if any(v in host for v in VENDOR_DOMAINS):
+            # Special case for Intuit: require /link in path
+            if "intuit.com" in host:
+                return "/link" in path
+            return True
+        return False
+    except Exception:
+        return False
+
+def _is_clientish_path(abs_href: str, site_host: str) -> bool:
+    try:
+        p = urlparse(abs_href)
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+        # Only treat as client-ish if same-origin OR clear client/portal term in path
+        same_origin = site_host and host.endswith(site_host)
+        if any(h in path for h in CLIENT_PATH_HINTS):
+            # Still ignore if it's clearly WordPress
+            if _is_wp_login_url(abs_href):
+                return False
+            return True if same_origin or any(w in path for w in ["client", "portal"]) else False
+        return False
+    except Exception:
+        return False
+
+def _page_has_wp_login(soup: BeautifulSoup, base_url: str) -> bool:
+    # a) anchors/forms that go to wp login/admin/json
+    for tag in soup.find_all(["a", "form"], href=True) + soup.find_all("form", action=True):
+        href = tag.get("href") or tag.get("action") or ""
+        abs_href = urljoin(base_url, href)
+        if _is_wp_login_url(abs_href):
+            return True
+    return False
+
+def _gather_links(soup: BeautifulSoup, base_url: str):
+    links = []
+    for tag in soup.find_all(["a", "button"], href=True) + soup.find_all("a", href=True):
+        text = _norm(tag.get_text())
+        href = tag.get("href") or ""
+        abs_href = urljoin(base_url, href)
+        links.append((text, abs_href))
+    return links
+
 def _find_in_html(base_url, html):
     soup = BeautifulSoup(html, "html.parser")
-    wp_present = _has_wp_login(soup, base_url)  # used to filter false positives
+    site_host = urlparse(base_url).netloc.lower()
+    wp_present = _page_has_wp_login(soup, base_url)
 
-    # 1) Page text: match only STRONG portal phrases in free text
+    # Collect links once for multiple passes
+    links = _gather_links(soup, base_url)
+
+    # QUICK VENDOR PASS (highest confidence)
+    for text, abs_href in links:
+        if _is_wp_login_url(abs_href):
+            continue
+        if _is_vendor_url(abs_href):
+            return True, f"Found vendor portal → {abs_href}"
+
+    # If WordPress login is present AND there are no vendor links AND nothing client/portal-ish, hard-fail early
+    if wp_present:
+        has_clientish = any(_is_clientish_path(h, site_host) for _, h in links)
+        if not has_clientish:
+            return False, "WP login present; no vendor or client/portal paths."
+
+    # PAGE TEXT: accept only strong phrases (generic login text is ignored in free text)
     page_text = soup.get_text(separator=" ", strip=True).lower()
     for kw in STRONG_TEXT_KEYWORDS:
         if kw in page_text:
-            # If this page ONLY exposes a WP login, don't count it
-            if wp_present and "portal" not in kw and "client" not in kw and "account" not in kw and "upload" not in kw and "share" not in kw and "send" not in kw:
-                # Overly defensive, but keeps us from tripping on generic text when WP is present
-                pass
-            else:
-                return True, f'Found text match "{kw}" on {base_url}'
+            return True, f'Found text match "{kw}" on {base_url}'
 
-    # 2) Anchors & buttons (text + href)
-    def norm(s):
-        return " ".join((s or "").strip().lower().split())
-
-    # Include both <a> and <button> with hrefs
-    link_like_tags = list(soup.find_all(["a", "button"], href=True)) + list(soup.find_all("a", href=True))
-    for tag in link_like_tags:
-        text = norm(tag.get_text())
-        href = tag.get("href") or ""
-        abs_href = urljoin(base_url, href)
-        href_l = abs_href.lower()
-
-        # If this is a WP login link, ignore it entirely
+    # LINK/BUTTON TEXT: allow strong or generic words but require vendor URL OR client/portal-ish path
+    for text, abs_href in links:
         if _is_wp_login_url(abs_href):
             continue
 
-        # Text cues: allow both strong and generic login words—but only when it's actually a link
-        if any(kw in text for kw in STRONG_TEXT_KEYWORDS) or any(w in text for w in GENERIC_LOGIN_WORDS):
-            return True, f'Found link/button "{text}" → {abs_href}'
+        has_loginish_text = any(kw in text for kw in STRONG_TEXT_KEYWORDS) or any(w in text for w in GENERIC_LOGIN_WORDS)
+        if not has_loginish_text:
+            continue
 
-        # Vendor/path cues in href
-        if any(h in href_l for h in HREF_HINTS):
-            return True, f"Found portal/vendor href → {abs_href}"
+        if _is_vendor_url(abs_href) or _is_clientish_path(abs_href, site_host):
+            return True, f'Found portal link/button "{text}" → {abs_href}'
 
-    # 3) Non-anchor buttons/spans/divs with a portal-ish label (no href)
-    # Don’t count generic “login” text here—too noisy; require stronger terms
-    for tag in soup.find_all(["button", "span", "div"]):
-        label = norm(tag.get_text())
-        if any(kw in label for kw in STRONG_TEXT_KEYWORDS):
-            # If it's clearly a WP-only login page, ignore
-            if _has_wp_login(soup, base_url):
+        # If URL is obviously generic auth (e.g., /login) without client/portal hints, ignore
+        try:
+            p = urlparse(abs_href)
+            path = (p.path or "").lower()
+            if any(path.endswith(g) or path == g for g in GENERIC_AUTH_PATHS):
                 continue
+        except Exception:
+            pass
+
+    # CLICKABLE (no href): only strong phrases; still ignored if the page is WP-only
+    for tag in soup.find_all(["button", "span", "div"]):
+        label = _norm(tag.get_text())
+        if any(kw in label for kw in STRONG_TEXT_KEYWORDS):
+            if wp_present:
+                # require some client/portal path or vendor link on page to avoid WP-only false positives
+                has_clientish = any(_is_clientish_path(h, site_host) for _, h in links) or any(_is_vendor_url(h) for _, h in links)
+                if not has_clientish:
+                    continue
             return True, f'Found clickable label "{label}" on {base_url}'
 
-    return False, "No portal signals in initial HTML."
+    return False, "No client-portal signals found."
 
 def check_client_portal(url: str):
     try:
@@ -131,7 +189,7 @@ def check_client_portal(url: str):
         if ok:
             return True, msg
 
-        # Probe common portal paths (and still ignore WordPress)
+        # Probe known client/portal paths (no generic /login probes)
         for path in COMMON_PORTAL_PATHS:
             try:
                 probe = urljoin(resp.url.rstrip("/") + "/", path.lstrip("/"))
