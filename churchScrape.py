@@ -1,169 +1,205 @@
-# --- add these imports at top if not already present ---
-import json
+# churchScrape.py
 import re
+from urllib.parse import urljoin, urlparse
+import requests
 from bs4 import BeautifulSoup
 
-# --- add helpers ---
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": UA})
 
-_US_TERMS = [
-    "united states", "u.s.", "u.s.a.", "usa", "us only", "remote - us", "remote (us)",
-    "authorized to work in the us", "work authorization in the us", "us citizenship"
+# Strong phrases we accept from free text
+STRONG_TEXT_KEYWORDS = [
+    "client login", "client portal", "client center", "client access",
+    "my account", "account login", "secure login", "secure portal",
+    "file upload", "upload files", "upload documents",
+    "share files", "send files",
+]
+# Only trusted when it's an actual link and the URL is vendor or client/portal path
+GENERIC_LOGIN_WORDS = ["log in", "login", "sign in", "signin"]
+
+# Vendor domains (off-site portals)
+VENDOR_DOMAINS = [
+    "sharefile.com",          # Citrix ShareFile
+    "smartvault.com",         # SmartVault
+    "netclientcs.com",        # Thomson Reuters NetClient CS
+    "clientaxcess.com",       # CCH Axcess
+    "onvio.us",               # Thomson Reuters Onvio
+    "canopytax.com",          # Canopy
+    "securefilepro.com",      # Drake Portals
+    "liscio.me", "app.liscio",
+    "taxcaddy.com",           # SurePrep TaxCaddy
+    "verifyle.com",
+    "fileinvite.com",
+    "suralink.com",
+    "intuit.com",             # Intuit Link lives under this; we’ll check path
 ]
 
-# State names/abbrevs for extra signal (keep short to avoid false positives)
-_US_STATE_NAMES = [
-    "alabama","alaska","arizona","arkansas","california","colorado","connecticut","delaware",
-    "florida","georgia","hawaii","idaho","illinois","indiana","iowa","kansas","kentucky",
-    "louisiana","maine","maryland","massachusetts","michigan","minnesota","mississippi","missouri",
-    "montana","nebraska","nevada","new hampshire","new jersey","new mexico","new york",
-    "north carolina","north dakota","ohio","oklahoma","oregon","pennsylvania","rhode island",
-    "south carolina","south dakota","tennessee","texas","utah","vermont","virginia","washington",
-    "west virginia","wisconsin","wyoming", "district of columbia", "washington, dc", "dc"
-]
-_US_STATE_ABBR = [
-    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY",
-    "LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND",
-    "OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY","DC"
+# Client/portal-ish path hints (safe on same-origin)
+CLIENT_PATH_HINTS = [
+    "client-portal", "clientportal", "client_center", "clientcenter",
+    "/client", "/clients", "/portal", "/client-login", "/clientlogin",
+    "/account/login", "/accounts/login"  # still require client/portal word
 ]
 
-# Avoid false positives like "react quickly", "reaction", "reactive"
-_REACT_RE = re.compile(r"\breact(?:\.?js|\s*js)?\b", re.I)
-_BAD_REACT_CONTEXT = re.compile(r"\breact(ive|ion|s|or|ants?)\b", re.I)
+# We explicitly DO NOT treat these generic auth paths as signals by themselves.
+GENERIC_AUTH_PATHS = ["/login", "/signin", "/sign-in", "/account", "/user/login", "/auth/login"]
 
-_CITY_STATE_RE = re.compile(r"\b[A-Z][a-zA-Z]+,\s?(?:{})\b".format("|".join(_US_STATE_ABBR)))
+# Common “guess” paths to probe
+COMMON_PORTAL_PATHS = [
+    "/client-portal", "/clientportal", "/client-login",
+    "/clientcenter", "/portal", "/clients"
+]
 
-def _is_us_text(txt: str) -> bool:
-    t = txt.lower()
-    if any(term in t for term in _US_TERMS):
-        return True
-    if any(name in t for name in _US_STATE_NAMES):
-        return True
-    # “City, ST” pattern e.g., “Denver, CO”
-    if _CITY_STATE_RE.search(txt):
-        return True
+# WordPress login patterns (block these completely)
+WP_LOGIN_URL_RE = re.compile(
+    r"(^|/)(wp-login\.php|wp-admin|wp-json)(/|$)", re.I
+)
+WP_ANY_WP_RE = re.compile(r"(^|/)wp-[a-z0-9_-]+", re.I)  # extra safety (e.g., /wp-sso/, /wp-security-login/)
+
+def _is_wp_login_url(url: str) -> bool:
+    try:
+        p = urlparse(url or "")
+        full = (p.path or "") + ("?" + (p.query or "") if p.query else "")
+        return bool(WP_LOGIN_URL_RE.search(full) or WP_ANY_WP_RE.search(full))
+    except Exception:
+        return False
+
+def _fetch(url):
+    r = SESSION.get(url, timeout=15, allow_redirects=True)
+    r.raise_for_status()
+    return r
+
+def _norm(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+def _is_vendor_url(abs_href: str) -> bool:
+    try:
+        p = urlparse(abs_href)
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+        if any(v in host for v in VENDOR_DOMAINS):
+            # Special case for Intuit: require /link in path
+            if "intuit.com" in host:
+                return "/link" in path
+            return True
+        return False
+    except Exception:
+        return False
+
+def _is_clientish_path(abs_href: str, site_host: str) -> bool:
+    try:
+        p = urlparse(abs_href)
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+        # Only treat as client-ish if same-origin OR clear client/portal term in path
+        same_origin = site_host and host.endswith(site_host)
+        if any(h in path for h in CLIENT_PATH_HINTS):
+            # Still ignore if it's clearly WordPress
+            if _is_wp_login_url(abs_href):
+                return False
+            return True if same_origin or any(w in path for w in ["client", "portal"]) else False
+        return False
+    except Exception:
+        return False
+
+def _page_has_wp_login(soup: BeautifulSoup, base_url: str) -> bool:
+    # a) anchors/forms that go to wp login/admin/json
+    for tag in soup.find_all(["a", "form"], href=True) + soup.find_all("form", action=True):
+        href = tag.get("href") or tag.get("action") or ""
+        abs_href = urljoin(base_url, href)
+        if _is_wp_login_url(abs_href):
+            return True
     return False
 
-def _contains_react(txt: str) -> bool:
-    if _BAD_REACT_CONTEXT.search(txt):
-        return False
-    return bool(_REACT_RE.search(txt))
+def _gather_links(soup: BeautifulSoup, base_url: str):
+    links = []
+    for tag in soup.find_all(["a", "button"], href=True) + soup.find_all("a", href=True):
+        text = _norm(tag.get_text())
+        href = tag.get("href") or ""
+        abs_href = urljoin(base_url, href)
+        links.append((text, abs_href))
+    return links
 
-def _extract_jsonld_jobposting(soup: BeautifulSoup):
-    """Return a list of normalized dicts from schema.org JobPosting if present."""
-    jobs = []
-    for s in soup.find_all("script", type=lambda v: v and "ld+json" in v):
-        try:
-            data = json.loads(s.string or "")
-        except Exception:
+def _find_in_html(base_url, html):
+    soup = BeautifulSoup(html, "html.parser")
+    site_host = urlparse(base_url).netloc.lower()
+    wp_present = _page_has_wp_login(soup, base_url)
+
+    # Collect links once for multiple passes
+    links = _gather_links(soup, base_url)
+
+    # QUICK VENDOR PASS (highest confidence)
+    for text, abs_href in links:
+        if _is_wp_login_url(abs_href):
+            continue
+        if _is_vendor_url(abs_href):
+            return True, f"Found vendor portal → {abs_href}"
+
+    # If WordPress login is present AND there are no vendor links AND nothing client/portal-ish, hard-fail early
+    if wp_present:
+        has_clientish = any(_is_clientish_path(h, site_host) for _, h in links)
+        if not has_clientish:
+            return False, "WP login present; no vendor or client/portal paths."
+
+    # PAGE TEXT: accept only strong phrases (generic login text is ignored in free text)
+    page_text = soup.get_text(separator=" ", strip=True).lower()
+    for kw in STRONG_TEXT_KEYWORDS:
+        if kw in page_text:
+            return True, f'Found text match "{kw}" on {base_url}'
+
+    # LINK/BUTTON TEXT: allow strong or generic words but require vendor URL OR client/portal-ish path
+    for text, abs_href in links:
+        if _is_wp_login_url(abs_href):
             continue
 
-        # Some pages embed arrays or graphs
-        candidates = data if isinstance(data, list) else [data]
-        for node in candidates:
-            if not isinstance(node, dict):
+        has_loginish_text = any(kw in text for kw in STRONG_TEXT_KEYWORDS) or any(w in text for w in GENERIC_LOGIN_WORDS)
+        if not has_loginish_text:
+            continue
+
+        if _is_vendor_url(abs_href) or _is_clientish_path(abs_href, site_host):
+            return True, f'Found portal link/button "{text}" → {abs_href}'
+
+        # If URL is obviously generic auth (e.g., /login) without client/portal hints, ignore
+        try:
+            p = urlparse(abs_href)
+            path = (p.path or "").lower()
+            if any(path.endswith(g) or path == g for g in GENERIC_AUTH_PATHS):
                 continue
-            # Flatten @graph if present
-            graph = node.get("@graph")
-            if isinstance(graph, list):
-                for g in graph:
-                    if isinstance(g, dict):
-                        candidates.append(g)
+        except Exception:
+            pass
 
-            t = (node.get("@type") or node.get("type") or "")
-            if isinstance(t, list):
-                is_job = any(x.lower() == "jobposting" for x in t if isinstance(x, str))
-            else:
-                is_job = str(t).lower() == "jobposting"
+    # CLICKABLE (no href): only strong phrases; still ignored if the page is WP-only
+    for tag in soup.find_all(["button", "span", "div"]):
+        label = _norm(tag.get_text())
+        if any(kw in label for kw in STRONG_TEXT_KEYWORDS):
+            if wp_present:
+                # require some client/portal path or vendor link on page to avoid WP-only false positives
+                has_clientish = any(_is_clientish_path(h, site_host) for _, h in links) or any(_is_vendor_url(h) for _, h in links)
+                if not has_clientish:
+                    continue
+            return True, f'Found clickable label "{label}" on {base_url}'
 
-            if not is_job:
-                continue
+    return False, "No client-portal signals found."
 
-            title = (node.get("title") or node.get("name") or "")
-            desc  = node.get("description") or ""
-
-            # Locations can be under jobLocation / applicantLocationRequirements
-            locations = []
-            jl = node.get("jobLocation")
-            if isinstance(jl, list):
-                for loc in jl:
-                    addr = (loc or {}).get("address") or {}
-                    locations.append(" ".join(filter(None, [
-                        addr.get("addressLocality"), addr.get("addressRegion"), addr.get("addressCountry")
-                    ])))
-            elif isinstance(jl, dict):
-                addr = jl.get("address") or {}
-                locations.append(" ".join(filter(None, [
-                    addr.get("addressLocality"), addr.get("addressRegion"), addr.get("addressCountry")
-                ])))
-
-            # applicantLocationRequirements may specify “US”
-            alr = node.get("applicantLocationRequirements")
-            if isinstance(alr, list):
-                for req in alr:
-                    locations.append(str(req))
-            elif alr:
-                locations.append(str(alr))
-
-            jobs.append({
-                "title": title or "",
-                "description": desc or "",
-                "locations_text": " | ".join([l for l in locations if l]) or ""
-            })
-    return jobs
-
-def _classify_react_us_from_html(base_url: str, html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(separator=" ", strip=True)
-
-    # 1) JSON-LD JobPosting first (most structured)
-    for job in _extract_jsonld_jobposting(soup):
-        has_react = _contains_react(job["title"]) or _contains_react(job["description"])
-        is_us = _is_us_text(job["locations_text"]) or _is_us_text(job["description"])
-        if has_react and is_us:
-            return True, "React job in the US found via JSON-LD JobPosting."
-        if has_react:
-            return False, "React job found via JSON-LD, but US location not clear."
-
-    # 2) Fall back to page text heuristics
-    has_react = _contains_react(text)
-    is_us = _is_us_text(text)
-
-    if has_react and is_us:
-        return True, "React job in the US found via page text."
-    if has_react:
-        return False, "React job found, but US location not clear."
-    return False, "No React job signals found."
-# --- add the new public checker ---
-
-def check_react_job_us(url: str):
-    """Return (bool|None, message) like your existing check_client_portal:
-       True  => React + US confirmed
-       False => not React/US (or ambiguous)
-       None  => network/error
-    """
+def check_client_portal(url: str):
     try:
-        r = _fetch(url)
-        ok, msg = _classify_react_us_from_html(r.url, r.text)
+        resp = _fetch(url)
+        ok, msg = _find_in_html(resp.url, resp.text)
         if ok:
             return True, msg
 
-        # Optional: follow one “Jobs/Careers” style link and try again (lightweight crawl)
-        soup = BeautifulSoup(r.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            label = (a.get_text() or "").strip().lower()
-            if any(k in label for k in ["careers", "jobs", "open roles", "join us"]):
-                probe = urljoin(r.url, a["href"])
-                try:
-                    r2 = _fetch(probe)
-                    ok2, msg2 = _classify_react_us_from_html(r2.url, r2.text)
-                    if ok2:
-                        return True, f"Found via careers page {probe}: {msg2}"
-                    # if React found but not US, keep that message as a fallback
-                    if "React job found" in msg2:
-                        return False, f"Found via careers page {probe}: {msg2}"
-                except requests.RequestException:
-                    pass
+        # Probe known client/portal paths (no generic /login probes)
+        for path in COMMON_PORTAL_PATHS:
+            try:
+                probe = urljoin(resp.url.rstrip("/") + "/", path.lstrip("/"))
+                r2 = _fetch(probe)
+                ok2, msg2 = _find_in_html(r2.url, r2.text)
+                if ok2:
+                    return True, f"Found via probe {probe}: {msg2}"
+            except requests.RequestException:
+                pass
 
-        return False, msg
+        return False, "No client-portal/login signals found."
     except requests.RequestException as e:
         return None, f"Request failed: {e}"
