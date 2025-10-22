@@ -2,7 +2,7 @@
 import streamlit as st
 from churchScrape import check_client_portal
 
-st.title('Client Portal Option Checker v5')
+st.title('React job Option Checker v5')
 
 url_input = st.text_area("Enter the URLs (one per line):")
 urls = [u.strip() for u in url_input.splitlines() if u.strip()]
