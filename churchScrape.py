@@ -183,23 +183,34 @@ def _find_in_html(base_url, html):
     return False, "No client-portal signals found."
 
 def check_client_portal(url: str):
+    """
+    Reused structure, but now detects if the page is about a React job in the US.
+    Returns (bool|None, message)
+    """
     try:
         resp = _fetch(url)
-        ok, msg = _find_in_html(resp.url, resp.text)
-        if ok:
-            return True, msg
+        text = resp.text.lower()
 
-        # Probe known client/portal paths (no generic /login probes)
-        for path in COMMON_PORTAL_PATHS:
-            try:
-                probe = urljoin(resp.url.rstrip("/") + "/", path.lstrip("/"))
-                r2 = _fetch(probe)
-                ok2, msg2 = _find_in_html(r2.url, r2.text)
-                if ok2:
-                    return True, f"Found via probe {probe}: {msg2}"
-            except requests.RequestException:
-                pass
+        # Look for React mentions (avoid "reaction"/"reactive" false positives)
+        has_react = any(
+            kw in text for kw in ["react.js", "react js", "react developer", "frontend react", "react engineer", "react"]
+        )
 
-        return False, "No client-portal/login signals found."
+        # Look for US/Remote-US signals
+        has_us = any(
+            kw in text for kw in [
+                "united states", "u.s.", "usa", "us only",
+                "remote - us", "remote (us)", "remote within the us",
+                "authorized to work in the us", "work authorization in the us"
+            ]
+        )
+
+        if has_react and has_us:
+            return True, "React job in the US found ✅"
+        elif has_react:
+            return False, "React job found, but US location not clear 🌎"
+        else:
+            return False, "No React job detected ❌"
+
     except requests.RequestException as e:
         return None, f"Request failed: {e}"
